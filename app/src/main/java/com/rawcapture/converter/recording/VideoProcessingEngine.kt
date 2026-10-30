@@ -145,8 +145,8 @@ class VideoProcessingEngine(
             var videoFormat: MediaFormat? = null
             var audioFormat: MediaFormat? = null
 
-            for (i in 0 until videoExtractor.trackCount) {
-                val fmt = videoExtractor.getTrackFormat(i)
+            for (i in 0 until videoExtractor!!.trackCount) {
+                val fmt = videoExtractor!!.getTrackFormat(i)
                 val mime = fmt.getString(MediaFormat.KEY_MIME) ?: continue
 
                 if (mime.startsWith("video/") && videoTrackIndex == -1) {
@@ -165,11 +165,11 @@ class VideoProcessingEngine(
 
             if (videoTrackIndex == -1 || videoFormat == null) {
                 videoFd.close()
-                videoExtractor.release()
+                videoExtractor!!.release()
                 return@withContext Result.Error("No video track found in source file")
             }
 
-            videoExtractor.selectTrack(videoTrackIndex)
+            videoExtractor!!.selectTrack(videoTrackIndex)
 
             val sourceMime = videoFormat.getString(MediaFormat.KEY_MIME) ?: "video/avc"
             val srcW = videoFormat.getInteger(MediaFormat.KEY_WIDTH)
@@ -186,8 +186,8 @@ class VideoProcessingEngine(
                     val audioFd = context.contentResolver.openFileDescriptor(sourceUri, "r")
                     if (audioFd != null) {
                         audioExtractor = MediaExtractor()
-                        audioExtractor.setDataSource(audioFd.fileDescriptor, 0, audioFd.statSize)
-                        audioExtractor.selectTrack(audioTrackIndex)
+                        audioExtractor!!.setDataSource(audioFd.fileDescriptor, 0, audioFd.statSize)
+                        audioExtractor!!.selectTrack(audioTrackIndex)
                         Log.i(TAG, "[Phase 1] Audio extractor ready")
                     }
                 } catch (e: Exception) {
@@ -211,7 +211,7 @@ class VideoProcessingEngine(
             val videoEncoderInfo = selectVideoEncoder(encoderMime, targetWidth, targetHeight, targetFps)
             if (videoEncoderInfo == null) {
                 videoFd.close()
-                videoExtractor.release()
+                videoExtractor!!.release()
                 return@withContext Result.Error("No compatible video encoder found for ${targetWidth}x${targetHeight}")
             }
             Log.i(TAG, "[Phase 2] Selected encoder: ${videoEncoderInfo.name}")
@@ -220,7 +220,7 @@ class VideoProcessingEngine(
             val videoDecoderInfo = selectVideoDecoder(sourceMime)
             if (videoDecoderInfo == null) {
                 videoFd.close()
-                videoExtractor.release()
+                videoExtractor!!.release()
                 return@withContext Result.Error("No compatible video decoder found for $sourceMime")
             }
             Log.i(TAG, "[Phase 2] Selected decoder: ${videoDecoderInfo.name}")
@@ -233,7 +233,7 @@ class VideoProcessingEngine(
             } catch (e: Exception) {
                 Log.e(TAG, "[Phase 3] Failed to create muxer", e)
                 videoFd.close()
-                videoExtractor.release()
+                videoExtractor!!.release()
                 return@withContext Result.Error("Failed to create output file: ${e.message}")
             }
 
@@ -278,7 +278,7 @@ class VideoProcessingEngine(
             } catch (e: Exception) {
                 Log.e(TAG, "[Phase 4] Video codec creation failed", e)
                 videoFd.close()
-                videoExtractor.release()
+                videoExtractor!!.release()
                 muxer?.release()
                 return@withContext Result.Error("Video codec initialization failed: ${e.message}")
             }
@@ -507,16 +507,16 @@ class VideoProcessingEngine(
                             if (aInIdx >= 0) {
                                 try {
                                     val buf = aDecInputBufs!![aInIdx]
-                                    val size = audioExtractor.readSampleData(buf, 0)
+                                    val size = audioExtractor!!.readSampleData(buf, 0)
                                     
                                     if (size < 0) {
                                         audioDecoder!!.queueInputBuffer(aInIdx, 0, 0, 0L,
                                             MediaCodec.BUFFER_FLAG_END_OF_STREAM)
                                         aDecInputDone = true
                                     } else {
-                                        val pts = audioExtractor.sampleTime
+                                        val pts = audioExtractor!!.sampleTime
                                         audioDecoder!!.queueInputBuffer(aInIdx, 0, size, pts, 0)
-                                        audioExtractor.advance()
+                                        audioExtractor!!.advance()
                                     }
                                 } catch (e: Exception) {
                                     Log.w(TAG, "[Phase 6] Audio decoder input error", e)
@@ -627,7 +627,7 @@ class VideoProcessingEngine(
 
             try {
                 videoFd.close()
-                videoExtractor.release()
+                videoExtractor!!.release()
                 audioExtractor?.release()
             } catch (e: Exception) {
                 Log.w(TAG, "[Phase 7] Extractor cleanup error", e)
