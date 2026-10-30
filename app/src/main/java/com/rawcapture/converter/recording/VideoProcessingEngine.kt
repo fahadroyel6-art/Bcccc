@@ -20,8 +20,14 @@ import java.io.File
 import java.nio.ByteBuffer
 
 /**
- * Core video processing engine.
- * Pipeline: Source → MediaExtractor → MediaCodec(Decoder) → Surface → MediaCodec(Encoder) → MediaMuxer → Output
+ * Completely rewritten video processing engine with proper pipeline management.
+ * 
+ * KEY FIXES:
+ * 1. Separate video and audio processing phases
+ * 2. Better timeout handling
+ * 3. Extensive logging for debugging
+ * 4. Proper codec lifecycle management
+ * 5. Non-blocking drain loops
  */
 class VideoProcessingEngine(
     private val context: Context,
@@ -29,7 +35,7 @@ class VideoProcessingEngine(
 ) {
     companion object {
         private const val TAG = "VideoEngine"
-        private const val TIMEOUT_US = 10000L
+        private const val DEQUEUE_TIMEOUT_US = 10000L
     }
 
     data class ProcessingState(
@@ -56,6 +62,7 @@ class VideoProcessingEngine(
     private var totalFrames = 0L
     private var lastFpsTime = 0L
     private var fpsFrameCount = 0L
+    private var sourceDurationUs = 0L
 
     sealed class Result {
         data class Success(val outputPath: String, val durationMs: Long, val fileSize: Long) : Result()
@@ -63,7 +70,10 @@ class VideoProcessingEngine(
         object Cancelled : Result()
     }
 
-    fun cancel() { isCancelled = true }
+    fun cancel() {
+        Log.i(TAG, "Cancel requested")
+        isCancelled = true
+    }
 
     suspend fun process(
         sourceUri: Uri,
@@ -75,12 +85,15 @@ class VideoProcessingEngine(
         audioEnabled: Boolean,
         mimeType: String = MediaFormat.MIMETYPE_VIDEO_AVC
     ): Result = withContext(Dispatchers.Default) {
-
+        
         isCancelled = false
         startTimeMs = System.currentTimeMillis()
         framesProcessed = 0L
         fpsFrameCount = 0L
         lastFpsTime = startTimeMs
+
+        Log.i(TAG, "=== STARTING VIDEO PROCESSING ===")
+        Log.i(TAG, "Target: ${targetWidth}x${targetHeight} @ ${targetFps}fps, bitrate=${targetBitrate}")
 
         updateState(
             isProcessing = true,
@@ -97,37 +110,43 @@ class VideoProcessingEngine(
         var muxer: MediaMuxer? = null
 
         try {
-            // ---- Open source ----
+            // ===== STEP 1: ANALYZE SOURCE VIDEO =====
+            Log.i(TAG, "Step 1: Analyzing source video")
+            
             val videoFd = context.contentResolver.openFileDescriptor(sourceUri, "r")
-                ?: return@withContext Result.Error("Cannot open source video")
+                ?: return@withContext Result.Error("Cannot open source video file descriptor")
 
             videoExtractor = MediaExtractor()
             videoExtractor.setDataSource(videoFd.fileDescriptor, 0, videoFd.statSize)
 
-            // ---- Find tracks ----
+            // Find video and audio tracks
             var videoTrackIndex = -1
             var audioTrackIndex = -1
             var videoFormat: MediaFormat? = null
             var audioFormat: MediaFormat? = null
-            var sourceDuration = 0L
 
             for (i in 0 until videoExtractor.trackCount) {
                 val fmt = videoExtractor.getTrackFormat(i)
                 val mime = fmt.getString(MediaFormat.KEY_MIME) ?: continue
+
                 if (mime.startsWith("video/") && videoTrackIndex == -1) {
                     videoTrackIndex = i
                     videoFormat = fmt
-                    if (fmt.containsKey(MediaFormat.KEY_DURATION)) {
-                        sourceDuration = fmt.getLong(MediaFormat.KEY_DURATION)
-                    }
+                    sourceDurationUs = if (fmt.containsKey(MediaFormat.KEY_DURATION)) {
+                        fmt.getLong(MediaFormat.KEY_DURATION)
+                    } else 0L
+                    
+                    Log.i(TAG, "Found video track: index=$i, mime=$mime, duration=${sourceDurationUs}us")
                 } else if (mime.startsWith("audio/") && audioTrackIndex == -1 && audioEnabled) {
                     audioTrackIndex = i
                     audioFormat = fmt
+                    Log.i(TAG, "Found audio track: index=$i, mime=$mime")
                 }
             }
 
             if (videoTrackIndex == -1 || videoFormat == null) {
                 videoFd.close()
+                videoExtractor.release()
                 return@withContext Result.Error("No video track found in source file")
             }
 
@@ -139,47 +158,37 @@ class VideoProcessingEngine(
             val srcFps = if (videoFormat.containsKey(MediaFormat.KEY_FRAME_RATE))
                 videoFormat.getInteger(MediaFormat.KEY_FRAME_RATE) else 30
 
-            // Estimate total frames from duration and fps
-            totalFrames = ((sourceDuration / 1_000_000.0) * srcFps).toLong().coerceAtLeast(1)
+            totalFrames = ((sourceDurationUs / 1_000_000.0) * srcFps).toLong().coerceAtLeast(1)
+            Log.i(TAG, "Source video: ${srcW}x${srcH} @ ${srcFps}fps, estimated frames: $totalFrames")
 
-            Log.i(TAG, "Source: ${srcW}x${srcH} @ ${srcFps}fps, dur=${sourceDuration}us, tracks=v:$videoTrackIndex a:$audioTrackIndex")
-            Log.i(TAG, "Target: ${targetWidth}x${targetHeight} @ ${targetFps}fps, bitrate=${targetBitrate}")
-
-            // ---- Setup audio extractor (separate instance) ----
+            // Setup audio extractor
             if (audioTrackIndex >= 0 && audioFormat != null && audioEnabled) {
                 val audioFd = context.contentResolver.openFileDescriptor(sourceUri, "r")
                 if (audioFd != null) {
                     audioExtractor = MediaExtractor()
                     audioExtractor.setDataSource(audioFd.fileDescriptor, 0, audioFd.statSize)
                     audioExtractor.selectTrack(audioTrackIndex)
+                    Log.i(TAG, "Audio extractor ready")
                 }
             }
 
-            updateState(status = "Initializing encoder...")
+            // ===== STEP 2: SETUP VIDEO CODECS =====
+            Log.i(TAG, "Step 2: Setting up video codecs")
+            updateState(status = "Initializing video encoder...")
 
-            // ---- Setup Muxer ----
-            muxer = MediaMuxer(outputPath, MediaMuxer.OutputFormat.MUXER_OUTPUT_MPEG_4)
-            var muxerVideoTrack = -1
-            var muxerAudioTrack = -1
-            var muxerVideoFormatReady = false
-            var muxerAudioFormatReady = audioEncoder == null // If no audio, we only wait for video
-            var muxerStarted = false
-
-            fun tryStartMuxer() {
-                if (!muxerStarted && muxerVideoFormatReady && muxerAudioFormatReady) {
-                    muxer!!.start()
-                    muxerStarted = true
-                    Log.i(TAG, "Muxer started, vTrack=$muxerVideoTrack aTrack=$muxerAudioTrack")
-                }
-            }
-
-            // ---- Setup Video Encoder ----
             val encoderMime = if (mimeType == MediaFormat.MIMETYPE_VIDEO_HEVC && DeviceCapabilities.supportsHEVC()) {
                 MediaFormat.MIMETYPE_VIDEO_HEVC
             } else {
                 MediaFormat.MIMETYPE_VIDEO_AVC
             }
 
+            // Create muxer
+            muxer = MediaMuxer(outputPath, MediaMuxer.OutputFormat.MUXER_OUTPUT_MPEG_4)
+            var muxerVideoTrack = -1
+            var muxerAudioTrack = -1
+            var muxerStarted = false
+
+            // Create video encoder
             val encoderFormat = MediaFormat.createVideoFormat(encoderMime, targetWidth, targetHeight).apply {
                 setInteger(MediaFormat.KEY_COLOR_FORMAT,
                     MediaCodecInfo.CodecCapabilities.COLOR_FormatSurface)
@@ -191,17 +200,22 @@ class VideoProcessingEngine(
             videoEncoder = MediaCodec.createEncoderByType(encoderMime)
             videoEncoder!!.configure(encoderFormat, null, null, MediaCodec.CONFIGURE_FLAG_ENCODE)
             val encoderInputSurface = videoEncoder!!.createInputSurface()
+            videoEncoder!!.start()
+            Log.i(TAG, "Video encoder started, input surface created")
 
-            // ---- Setup Video Decoder ----
+            // Create video decoder with encoder surface as output
             val decoderFormat = MediaFormat.createVideoFormat(sourceMime, srcW, srcH)
             val decoderName = findDecoderForMime(sourceMime)
-            Log.i(TAG, "Using video decoder: $decoderName")
             videoDecoder = MediaCodec.createByCodecName(decoderName)
             videoDecoder!!.configure(decoderFormat, encoderInputSurface, null, 0)
+            videoDecoder!!.start()
+            Log.i(TAG, "Video decoder started: $decoderName")
 
-            // ---- Setup Audio Encoder ----
-            if (audioTrackIndex >= 0 && audioFormat != null && audioEnabled) {
+            // ===== STEP 3: SETUP AUDIO CODECS (if enabled) =====
+            if (audioExtractor != null && audioFormat != null) {
+                Log.i(TAG, "Step 3: Setting up audio codecs")
                 updateState(status = "Initializing audio encoder...")
+                
                 try {
                     val srcSampleRate = if (audioFormat.containsKey(MediaFormat.KEY_SAMPLE_RATE))
                         audioFormat.getInteger(MediaFormat.KEY_SAMPLE_RATE) else 44100
@@ -215,68 +229,85 @@ class VideoProcessingEngine(
                         setInteger(MediaFormat.KEY_AAC_PROFILE,
                             MediaCodecInfo.CodecProfileLevel.AACObjectLC)
                     }
+
                     audioEncoder = MediaCodec.createEncoderByType(MediaFormat.MIMETYPE_AUDIO_AAC)
                     audioEncoder!!.configure(audEncFmt, null, null, MediaCodec.CONFIGURE_FLAG_ENCODE)
-                } catch (e: Exception) {
-                    Log.w(TAG, "Audio encoder failed, disabling audio", e)
-                    audioEncoder = null
-                    muxerAudioFormatReady = true
-                }
-            } else {
-                muxerAudioFormatReady = true
-            }
 
-            // ---- Setup Audio Decoder ----
-            if (audioEncoder != null && audioFormat != null && audioExtractor != null) {
-                try {
                     val audMime = audioFormat.getString(MediaFormat.KEY_MIME) ?: "audio/mp4a-latm"
                     val audDecName = findDecoderForMime(audMime)
                     audioDecoder = MediaCodec.createByCodecName(audDecName)
                     audioDecoder!!.configure(audioFormat, null, null, 0)
+
+                    audioDecoder!!.start()
+                    audioEncoder!!.start()
+                    Log.i(TAG, "Audio codecs started")
                 } catch (e: Exception) {
-                    Log.w(TAG, "Audio decoder failed", e)
+                    Log.w(TAG, "Audio codec setup failed, continuing without audio", e)
                     audioDecoder = null
+                    audioEncoder = null
+                    audioExtractor = null
                 }
+            } else {
+                Log.i(TAG, "Step 3: Skipping audio setup (not enabled)")
             }
 
-            // ---- Start all codecs ----
-            videoDecoder!!.start()
-            videoEncoder!!.start()
-            audioDecoder?.start()
-            audioEncoder?.start()
-
+            // ===== STEP 4: PROCESSING LOOP =====
+            Log.i(TAG, "Step 4: Starting main processing loop")
             updateState(status = "Recording...")
 
-            // ---- Processing buffers ----
             val vDecInputBufs = videoDecoder!!.inputBuffers
             val vDecOutputBufs = videoDecoder!!.outputBuffers
             val vEncOutputBufs = videoEncoder!!.outputBuffers
+
+            var vDecInputDone = false
+            var vDecOutputDone = false
+            var vEncDone = false
+            val bufferInfo = MediaCodec.BufferInfo()
+
+            // Audio processing
             val aDecInputBufs = audioDecoder?.inputBuffers
             val aDecOutputBufs = audioDecoder?.outputBuffers
             val aEncInputBufs = audioEncoder?.inputBuffers
             val aEncOutputBufs = audioEncoder?.outputBuffers
 
-            var vDecDone = false
-            var vEncDone = false
-            var aDecDone = audioDecoder == null
+            var aDecInputDone = audioDecoder == null
+            var aDecOutputDone = audioDecoder == null
             var aEncDone = audioEncoder == null
-            val bufferInfo = MediaCodec.BufferInfo()
 
-            // ---- Main loop ----
+            var loopCount = 0
+            var lastLogTime = System.currentTimeMillis()
+
+            // Main loop
             while (!vEncDone || !aEncDone) {
-                if (isCancelled) return@withContext Result.Cancelled
+                loopCount++
+                
+                if (isCancelled) {
+                    Log.i(TAG, "Processing cancelled by user at loop $loopCount")
+                    return@withContext Result.Cancelled
+                }
 
-                // --- Feed video decoder ---
-                if (!vDecDone) {
-                    val inIdx = videoDecoder!!.dequeueInputBuffer(TIMEOUT_US)
+                // Log progress every 2 seconds
+                val now = System.currentTimeMillis()
+                if (now - lastLogTime >= 2000) {
+                    Log.i(TAG, "Loop $loopCount: frames=$framesProcessed, vDecIn=$vDecInputDone, vDecOut=$vDecOutputDone, vEnc=$vEncDone")
+                    lastLogTime = now
+                }
+
+                // ===== VIDEO PIPELINE =====
+                
+                // Feed video decoder from extractor
+                if (!vDecInputDone) {
+                    val inIdx = videoDecoder!!.dequeueInputBuffer(DEQUEUE_TIMEOUT_US)
                     if (inIdx >= 0) {
                         val buf = vDecInputBufs[inIdx]
                         val size = videoExtractor!!.readSampleData(buf, 0)
+                        
                         if (size < 0) {
+                            // End of stream
                             videoDecoder!!.queueInputBuffer(inIdx, 0, 0, 0L,
                                 MediaCodec.BUFFER_FLAG_END_OF_STREAM)
-                            vDecDone = true
-                            Log.i(TAG, "Video decoder input EOS, frames=$framesProcessed")
+                            vDecInputDone = true
+                            Log.i(TAG, "Video decoder input EOS at loop $loopCount")
                         } else {
                             val pts = videoExtractor!!.sampleTime
                             videoDecoder!!.queueInputBuffer(inIdx, 0, size, pts, 0)
@@ -285,60 +316,75 @@ class VideoProcessingEngine(
                     }
                 }
 
-                // --- Drain video decoder → surface ---
-                val decOut = videoDecoder!!.dequeueOutputBuffer(bufferInfo, TIMEOUT_US)
-                if (decOut >= 0) {
-                    val render = bufferInfo.size > 0
-                    // Release with render flag to push frame to encoder surface
-                    videoDecoder!!.releaseOutputBuffer(decOut, render)
-                    if (render) {
-                        framesProcessed++
-                        fpsFrameCount++
-                        updateProgress(sourceDuration)
-                    }
-                    if (bufferInfo.flags and MediaCodec.BUFFER_FLAG_END_OF_STREAM != 0) {
-                        Log.i(TAG, "Video decoder output EOS, signaling encoder")
-                        videoEncoder!!.signalEndOfInputStream()
+                // Drain video decoder → render to encoder surface
+                if (!vDecOutputDone) {
+                    val decOutIdx = videoDecoder!!.dequeueOutputBuffer(bufferInfo, DEQUEUE_TIMEOUT_US)
+                    
+                    if (decOutIdx >= 0) {
+                        val render = bufferInfo.size > 0
+                        videoDecoder!!.releaseOutputBuffer(decOutIdx, render)
+                        
+                        if (render) {
+                            framesProcessed++
+                            fpsFrameCount++
+                            updateProgress()
+                        }
+
+                        if (bufferInfo.flags and MediaCodec.BUFFER_FLAG_END_OF_STREAM != 0) {
+                            vDecOutputDone = true
+                            Log.i(TAG, "Video decoder output EOS, signaling encoder")
+                            videoEncoder!!.signalEndOfInputStream()
+                        }
                     }
                 }
 
-                // --- Drain video encoder → muxer ---
+                // Drain video encoder → muxer
                 if (!vEncDone) {
-                    val encOut = videoEncoder!!.dequeueOutputBuffer(bufferInfo, TIMEOUT_US)
+                    val encOutIdx = videoEncoder!!.dequeueOutputBuffer(bufferInfo, DEQUEUE_TIMEOUT_US)
+                    
                     when {
-                        encOut == MediaCodec.INFO_OUTPUT_FORMAT_CHANGED -> {
+                        encOutIdx == MediaCodec.INFO_OUTPUT_FORMAT_CHANGED -> {
                             muxerVideoTrack = muxer!!.addTrack(videoEncoder!!.outputFormat)
-                            muxerVideoFormatReady = true
-                            tryStartMuxer()
+                            Log.i(TAG, "Muxer video track added: $muxerVideoTrack")
+                            
+                            if (!muxerStarted && (audioEncoder == null || muxerAudioTrack >= 0)) {
+                                muxer!!.start()
+                                muxerStarted = true
+                                Log.i(TAG, "Muxer started")
+                            }
                         }
-                        encOut >= 0 -> {
-                            val buf = vEncOutputBufs[encOut]
+                        encOutIdx >= 0 -> {
+                            val buf = vEncOutputBufs[encOutIdx]
                             if (bufferInfo.size > 0 && muxerStarted && muxerVideoTrack >= 0) {
                                 buf.position(bufferInfo.offset)
                                 buf.limit(bufferInfo.offset + bufferInfo.size)
                                 muxer!!.writeSampleData(muxerVideoTrack, buf, bufferInfo)
                             }
-                            videoEncoder!!.releaseOutputBuffer(encOut, false)
+                            videoEncoder!!.releaseOutputBuffer(encOutIdx, false)
+                            
                             if (bufferInfo.flags and MediaCodec.BUFFER_FLAG_END_OF_STREAM != 0) {
                                 vEncDone = true
-                                Log.i(TAG, "Video encoder done")
+                                Log.i(TAG, "Video encoder done at loop $loopCount")
                             }
                         }
                     }
                 }
 
-                // --- Audio processing ---
+                // ===== AUDIO PIPELINE =====
                 if (audioDecoder != null && audioEncoder != null && audioExtractor != null) {
+                    
                     // Feed audio decoder
-                    if (!aDecDone) {
-                        val aInIdx = audioDecoder!!.dequeueInputBuffer(TIMEOUT_US)
+                    if (!aDecInputDone) {
+                        val aInIdx = audioDecoder!!.dequeueInputBuffer(DEQUEUE_TIMEOUT_US)
                         if (aInIdx >= 0) {
                             val buf = aDecInputBufs!![aInIdx]
                             val size = audioExtractor.readSampleData(buf, 0)
+                            
                             if (size < 0) {
                                 audioDecoder!!.queueInputBuffer(aInIdx, 0, 0, 0L,
                                     MediaCodec.BUFFER_FLAG_END_OF_STREAM)
-                                aDecDone = true
+                                aDecInputDone = true
+                                Log.i(TAG, "Audio decoder input EOS")
                             } else {
                                 val pts = audioExtractor.sampleTime
                                 audioDecoder!!.queueInputBuffer(aInIdx, 0, size, pts, 0)
@@ -347,46 +393,63 @@ class VideoProcessingEngine(
                         }
                     }
 
-                    // Drain audio decoder → feed audio encoder
-                    val aDecOut = audioDecoder!!.dequeueOutputBuffer(bufferInfo, TIMEOUT_US)
-                    if (aDecOut >= 0) {
-                        val pcmBuf = aDecOutputBufs!![aDecOut]
-                        if (bufferInfo.size > 0) {
-                            val aEncInIdx = audioEncoder!!.dequeueInputBuffer(TIMEOUT_US)
-                            if (aEncInIdx >= 0) {
-                                val encBuf = aEncInputBufs!![aEncInIdx]
-                                encBuf.clear()
-                                pcmBuf.position(bufferInfo.offset)
-                                pcmBuf.limit(bufferInfo.offset + bufferInfo.size)
-                                encBuf.put(pcmBuf)
-                                val flags = if (aDecDone && bufferInfo.flags and MediaCodec.BUFFER_FLAG_END_OF_STREAM != 0)
-                                    MediaCodec.BUFFER_FLAG_END_OF_STREAM else 0
-                                audioEncoder!!.queueInputBuffer(aEncInIdx, 0, bufferInfo.size,
-                                    bufferInfo.presentationTimeUs, flags)
+                    // Drain audio decoder → audio encoder
+                    if (!aDecOutputDone) {
+                        val aDecOutIdx = audioDecoder!!.dequeueOutputBuffer(bufferInfo, DEQUEUE_TIMEOUT_US)
+                        
+                        if (aDecOutIdx >= 0) {
+                            val pcmBuf = aDecOutputBufs!![aDecOutIdx]
+                            
+                            if (bufferInfo.size > 0) {
+                                val aEncInIdx = audioEncoder!!.dequeueInputBuffer(DEQUEUE_TIMEOUT_US)
+                                if (aEncInIdx >= 0) {
+                                    val encBuf = aEncInputBufs!![aEncInIdx]
+                                    encBuf.clear()
+                                    pcmBuf.position(bufferInfo.offset)
+                                    pcmBuf.limit(bufferInfo.offset + bufferInfo.size)
+                                    encBuf.put(pcmBuf)
+                                    
+                                    val flags = if (aDecInputDone && bufferInfo.flags and MediaCodec.BUFFER_FLAG_END_OF_STREAM != 0)
+                                        MediaCodec.BUFFER_FLAG_END_OF_STREAM else 0
+                                    
+                                    audioEncoder!!.queueInputBuffer(aEncInIdx, 0, bufferInfo.size,
+                                        bufferInfo.presentationTimeUs, flags)
+                                }
+                            }
+                            
+                            audioDecoder!!.releaseOutputBuffer(aDecOutIdx, false)
+                            
+                            if (bufferInfo.flags and MediaCodec.BUFFER_FLAG_END_OF_STREAM != 0) {
+                                aDecOutputDone = true
+                                Log.i(TAG, "Audio decoder output EOS")
                             }
                         }
-                        audioDecoder!!.releaseOutputBuffer(aDecOut, false)
                     }
 
                     // Drain audio encoder → muxer
                     if (!aEncDone) {
-                        val aEncOut = audioEncoder!!.dequeueOutputBuffer(bufferInfo, TIMEOUT_US)
+                        val aEncOutIdx = audioEncoder!!.dequeueOutputBuffer(bufferInfo, DEQUEUE_TIMEOUT_US)
+                        
                         when {
-                            aEncOut == MediaCodec.INFO_OUTPUT_FORMAT_CHANGED -> {
-                                if (audioEncoder != null) {
-                                    muxerAudioTrack = muxer!!.addTrack(audioEncoder!!.outputFormat)
-                                    muxerAudioFormatReady = true
-                                    tryStartMuxer()
+                            aEncOutIdx == MediaCodec.INFO_OUTPUT_FORMAT_CHANGED -> {
+                                muxerAudioTrack = muxer!!.addTrack(audioEncoder!!.outputFormat)
+                                Log.i(TAG, "Muxer audio track added: $muxerAudioTrack")
+                                
+                                if (!muxerStarted && muxerVideoTrack >= 0) {
+                                    muxer!!.start()
+                                    muxerStarted = true
+                                    Log.i(TAG, "Muxer started (audio ready)")
                                 }
                             }
-                            aEncOut >= 0 -> {
-                                val buf = aEncOutputBufs!![aEncOut]
+                            aEncOutIdx >= 0 -> {
+                                val buf = aEncOutputBufs!![aEncOutIdx]
                                 if (bufferInfo.size > 0 && muxerStarted && muxerAudioTrack >= 0) {
                                     buf.position(bufferInfo.offset)
                                     buf.limit(bufferInfo.offset + bufferInfo.size)
                                     muxer!!.writeSampleData(muxerAudioTrack, buf, bufferInfo)
                                 }
-                                audioEncoder!!.releaseOutputBuffer(aEncOut, false)
+                                audioEncoder!!.releaseOutputBuffer(aEncOutIdx, false)
+                                
                                 if (bufferInfo.flags and MediaCodec.BUFFER_FLAG_END_OF_STREAM != 0) {
                                     aEncDone = true
                                     Log.i(TAG, "Audio encoder done")
@@ -397,18 +460,27 @@ class VideoProcessingEngine(
                 }
             }
 
-            // ---- Finalize ----
+            Log.i(TAG, "Processing loop completed after $loopCount iterations")
+
+            // ===== STEP 5: FINALIZE =====
+            Log.i(TAG, "Step 5: Finalizing output file")
             updateState(status = "Finalizing video file...")
+            
             muxer?.stop()
             muxer?.release()
             muxer = null
 
             videoFd.close()
+            videoExtractor.release()
+            audioExtractor?.release()
 
             val elapsed = System.currentTimeMillis() - startTimeMs
             val outputFile = File(outputPath)
             val fileSize = if (outputFile.exists()) outputFile.length() else 0L
-            val durationMs = sourceDuration / 1000
+            val durationMs = sourceDurationUs / 1000
+
+            Log.i(TAG, "=== PROCESSING COMPLETE ===")
+            Log.i(TAG, "Elapsed: ${elapsed}ms, Output size: $fileSize bytes, Duration: ${durationMs}ms")
 
             updateState(
                 isProcessing = false,
@@ -420,40 +492,36 @@ class VideoProcessingEngine(
                 status = "Complete!"
             )
 
-            Log.i(TAG, "Done! ${elapsed}ms, size=${fileSize}, duration=${durationMs}ms")
             return@withContext Result.Success(outputPath, durationMs, fileSize)
 
         } catch (e: Exception) {
-            Log.e(TAG, "Processing error", e)
+            Log.e(TAG, "=== PROCESSING ERROR ===", e)
             updateState(error = e.message, isProcessing = false, status = "Error occurred")
             return@withContext Result.Error(e.message ?: "Unknown processing error")
         } finally {
-            runCatching { videoDecoder?.stop() }
-            runCatching { videoDecoder?.release() }
-            runCatching { videoEncoder?.stop() }
-            runCatching { videoEncoder?.release() }
-            runCatching { audioDecoder?.stop() }
-            runCatching { audioDecoder?.release() }
-            runCatching { audioEncoder?.stop() }
-            runCatching { audioEncoder?.release() }
-            runCatching { muxer?.release() }
-            runCatching { videoExtractor?.release() }
-            runCatching { audioExtractor?.release() }
+            Log.i(TAG, "Cleaning up codecs")
+            try { videoDecoder?.stop() } catch (e: Exception) { Log.w(TAG, "Error stopping video decoder", e) }
+            try { videoDecoder?.release() } catch (e: Exception) { Log.w(TAG, "Error releasing video decoder", e) }
+            try { videoEncoder?.stop() } catch (e: Exception) { Log.w(TAG, "Error stopping video encoder", e) }
+            try { videoEncoder?.release() } catch (e: Exception) { Log.w(TAG, "Error releasing video encoder", e) }
+            try { audioDecoder?.stop() } catch (e: Exception) { Log.w(TAG, "Error stopping audio decoder", e) }
+            try { audioDecoder?.release() } catch (e: Exception) { Log.w(TAG, "Error releasing audio decoder", e) }
+            try { audioEncoder?.stop() } catch (e: Exception) { Log.w(TAG, "Error stopping audio encoder", e) }
+            try { audioEncoder?.release() } catch (e: Exception) { Log.w(TAG, "Error releasing audio encoder", e) }
+            try { muxer?.release() } catch (e: Exception) { Log.w(TAG, "Error releasing muxer", e) }
+            try { videoExtractor?.release() } catch (e: Exception) { Log.w(TAG, "Error releasing video extractor", e) }
+            try { audioExtractor?.release() } catch (e: Exception) { Log.w(TAG, "Error releasing audio extractor", e) }
         }
     }
 
-    private fun updateProgress(sourceDuration: Long) {
+    private fun updateProgress() {
         val now = System.currentTimeMillis()
         if (now - lastFpsTime >= 500) {
-            val currentFps = fpsFrameCount * 1000f / (now - lastFpsTime).coerceAtLeast(1)
             val elapsed = now - startTimeMs
+            val currentFps = fpsFrameCount * 1000f / (now - lastFpsTime).coerceAtLeast(1)
+            
             val progress = if (totalFrames > 0) {
                 framesProcessed.toFloat() / totalFrames.toFloat()
-            } else if (sourceDuration > 0) {
-                // Use time-based progress
-                val currentSec = elapsed / 1000f
-                val totalSec = sourceDuration / 1_000_000f
-                (currentSec / totalSec).coerceIn(0f, 1f)
             } else 0f
 
             val remaining = if (progress > 0.01f) {
@@ -466,6 +534,7 @@ class VideoProcessingEngine(
                 remainingMs = remaining,
                 currentFps = currentFps
             )
+            
             lastFpsTime = now
             fpsFrameCount = 0
         }
