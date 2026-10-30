@@ -1,0 +1,19 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <style name="Theme.RawCapture" parent="Theme.Material3.Dark.NoActionBar">
+        <item name="colorPrimary">@color/emerald_green</item>
+        <item name="colorOnPrimary">@color/white</item>
+        <item name="colorSecondary">@color/yellow_accent</item>
+        <item name="colorOnSecondary">@color/black</item>
+        <item name="android:colorBackground">@color/black</item>
+        <item name="colorSurface">@color/dark_surface</item>
+        <item name="colorOnSurface">@color/white</item>
+        <item name="android:statusBarColor">@color/black</item>
+        <item name="android:navigationBarColor">@color/black</item>
+        <item name="android:windowLightStatusBar">false</item>
+    </style>
+
+    <style name="Theme.RawCapture.Splash" parent="Theme.RawCapture">
+        <item name="android:windowBackground">@color/black</item>
+    </style>
+</resources>

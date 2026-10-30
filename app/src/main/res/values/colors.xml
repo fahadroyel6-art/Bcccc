@@ -1,0 +1,15 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <color name="emerald_green">#10B981</color>
+    <color name="emerald_dark">#059669</color>
+    <color name="emerald_light">#34D399</color>
+    <color name="yellow_accent">#FBBF24</color>
+    <color name="red_accent">#EF4444</color>
+    <color name="black">#FF000000</color>
+    <color name="dark_card">#FF1A1A2E</color>
+    <color name="dark_border">#FF2A2A3E</color>
+    <color name="dark_surface">#FF0D0D1A</color>
+    <color name="white">#FFFFFFFF</color>
+    <color name="grey">#FF9CA3AF</color>
+    <color name="grey_light">#FFD1D5DB</color>
+</resources>
