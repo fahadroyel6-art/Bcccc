@@ -1,14 +1,18 @@
 package com.rawcapture.converter.ui.fragments
 
 import android.animation.ObjectAnimator
+import android.content.Intent
 import android.os.Bundle
+import android.util.Log
 import android.view.LayoutInflater
 import android.view.View
 import android.view.ViewGroup
 import android.view.animation.LinearInterpolator
+import android.widget.Toast
 import androidx.fragment.app.Fragment
 import androidx.lifecycle.lifecycleScope
 import com.rawcapture.converter.MainActivity
+import com.rawcapture.converter.R
 import com.rawcapture.converter.recording.RecordingService
 import com.rawcapture.converter.recording.VideoProcessingEngine
 import com.rawcapture.converter.databinding.FragmentProcessingBinding
@@ -24,6 +28,7 @@ class ProcessingFragment : Fragment() {
     private val binding get() = _binding!!
     private var pulseAnimator: ObjectAnimator? = null
     private var observeJob: Job? = null
+    private var completedNavigated = false
 
     override fun onCreateView(inflater: LayoutInflater, container: ViewGroup?, savedInstanceState: Bundle?): View {
         _binding = FragmentProcessingBinding.inflate(inflater, container, false)
@@ -32,8 +37,9 @@ class ProcessingFragment : Fragment() {
 
     override fun onViewCreated(view: View, savedInstanceState: Bundle?) {
         super.onViewCreated(view, savedInstanceState)
+        completedNavigated = false
 
-        // Start recording dot pulse animation
+        // Recording dot pulse animation
         pulseAnimator = ObjectAnimator.ofFloat(binding.recordingDot, "alpha", 1f, 0.3f).apply {
             duration = 800
             repeatCount = ObjectAnimator.INFINITE
@@ -42,19 +48,29 @@ class ProcessingFragment : Fragment() {
             start()
         }
 
-        // Poll the RecordingService's shared state for UI updates
+        // Check if service is running
+        if (!RecordingService.isServiceRunning) {
+            Log.w(TAG, "Service not running, starting recording")
+            (activity as? MainActivity)?.startRecording()
+        }
+
+        // Poll RecordingService shared state for UI updates
         observeJob = viewLifecycleOwner.lifecycleScope.launch {
             while (isActive) {
                 val state = RecordingService.currentState
                 updateUI(state)
 
-                if (state.isComplete && state.outputFilePath != null) {
+                // Check if complete - navigate only once
+                if (state.isComplete && state.outputFilePath != null && !completedNavigated) {
+                    completedNavigated = true
                     navigateToCompleted(state)
                     break
                 }
 
+                // Check for error
                 if (state.error != null) {
                     binding.tvStatus.text = "Error: ${state.error}"
+                    // Don't navigate away - let user see the error and cancel
                 }
 
                 delay(300)
@@ -63,6 +79,17 @@ class ProcessingFragment : Fragment() {
 
         binding.btnCancel.setOnClickListener {
             observeJob?.cancel()
+            
+            // Send cancel to service
+            try {
+                val cancelIntent = Intent(requireContext(), RecordingService::class.java).apply {
+                    action = RecordingService.ACTION_CANCEL
+                }
+                requireContext().startService(cancelIntent)
+            } catch (e: Exception) {
+                Log.w(TAG, "Failed to send cancel", e)
+            }
+
             val activity = activity as? MainActivity ?: return@setOnClickListener
             activity.supportFragmentManager.popBackStack(null, androidx.fragment.app.FragmentManager.POP_BACK_STACK_INCLUSIVE)
             activity.showFragment(HomeFragment(), addToBackStack = false)
@@ -111,5 +138,9 @@ class ProcessingFragment : Fragment() {
         observeJob?.cancel()
         super.onDestroyView()
         _binding = null
+    }
+
+    companion object {
+        private const val TAG = "ProcessingFragment"
     }
 }

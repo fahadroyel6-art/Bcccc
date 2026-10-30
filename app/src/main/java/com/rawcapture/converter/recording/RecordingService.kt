@@ -28,83 +28,62 @@ class RecordingService : Service() {
         private const val TAG = "RecordingService"
         const val NOTIFICATION_ID = 1001
         const val ACTION_CANCEL = "com.rawcapture.converter.CANCEL"
-        const val ACTION_PAUSE = "com.rawcapture.converter.PAUSE"
-        const val ACTION_RESUME = "com.rawcapture.converter.RESUME"
 
-        // Singleton state for UI
+        // Shared state for UI
         var currentState: VideoProcessingEngine.ProcessingState = VideoProcessingEngine.ProcessingState()
             private set
         var isServiceRunning = false
             private set
-
-        fun startRecording(context: Context, uri: Uri, settings: RecordingSettings) {
-            val intent = Intent(context, RecordingService::class.java).apply {
-                putExtra("video_uri", uri.toString())
-                putExtra("resolution", settings.resolution)
-                putExtra("fps", settings.fps)
-                putExtra("bitrate", settings.bitrate)
-                putExtra("aspect_ratio", settings.aspectRatio)
-                putExtra("audio_enabled", settings.audioEnabled)
-            }
-            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
-                context.startForegroundService(intent)
-            } else {
-                context.startService(intent)
-            }
-        }
     }
-
-    data class RecordingSettings(
-        val resolution: String = "1080p",
-        val fps: Int = 30,
-        val bitrate: String = "Medium",
-        val aspectRatio: String = "Original",
-        val audioEnabled: Boolean = true
-    )
 
     private val serviceScope = CoroutineScope(Dispatchers.Default + SupervisorJob())
     private var wakeLock: PowerManager.WakeLock? = null
-    private var engine: VideoProcessingEngine? = null
-    private var isPaused = false
+    private var processingJob: Job? = null
 
     override fun onBind(intent: Intent?): IBinder? = null
 
     override fun onCreate() {
         super.onCreate()
         isServiceRunning = true
+        Log.i(TAG, "Service created")
     }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
+        Log.i(TAG, "onStartCommand: action=${intent?.action}")
+
         if (intent?.action == ACTION_CANCEL) {
-            engine?.cancel()
+            Log.i(TAG, "Cancel action received")
+            processingJob?.cancel()
             stopSelf()
             return START_NOT_STICKY
         }
 
-        if (intent?.action == ACTION_PAUSE) {
-            isPaused = true
-            return START_STICKY
+        // Start foreground notification IMMEDIATELY
+        val startNotification = createNotification("Starting video conversion...", 0)
+        try {
+            startForeground(NOTIFICATION_ID, startNotification)
+        } catch (e: Exception) {
+            Log.e(TAG, "startForeground failed", e)
         }
-
-        if (intent?.action == ACTION_RESUME) {
-            isPaused = false
-            return START_STICKY
-        }
-
-        // Start foreground notification
-        startForeground(NOTIFICATION_ID, createNotification("Starting...", 0))
 
         // Acquire wake lock
-        val pm = getSystemService(Context.POWER_SERVICE) as PowerManager
-        wakeLock = pm.newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, "RawCapture::Processing").apply {
-            setReferenceCounted(false)
-            acquire(4 * 60 * 60 * 1000L) // 4 hours max
+        try {
+            val pm = getSystemService(Context.POWER_SERVICE) as PowerManager
+            wakeLock = pm.newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, "RawCapture::Processing").apply {
+                setReferenceCounted(false)
+                acquire(4 * 60 * 60 * 1000L)
+            }
+        } catch (e: Exception) {
+            Log.w(TAG, "Failed to acquire wake lock", e)
         }
 
-        val uriString = intent?.getStringExtra("video_uri") ?: run {
+        val uriString = intent?.getStringExtra("video_uri")
+        if (uriString == null) {
+            Log.e(TAG, "No video URI provided")
             stopSelf()
             return START_NOT_STICKY
         }
+
         val videoUri = Uri.parse(uriString)
         val resolution = intent.getStringExtra("resolution") ?: "1080p"
         val fps = intent.getIntExtra("fps", 30)
@@ -112,7 +91,12 @@ class RecordingService : Service() {
         val aspectRatio = intent.getStringExtra("aspect_ratio") ?: "Original"
         val audioEnabled = intent.getBooleanExtra("audio_enabled", true)
 
-        serviceScope.launch {
+        Log.i(TAG, "Starting processing: uri=$uriString, res=$resolution, fps=$fps, bitrate=$bitrate, audio=$audioEnabled")
+
+        // Cancel any existing processing
+        processingJob?.cancel()
+
+        processingJob = serviceScope.launch {
             processVideo(videoUri, resolution, fps, bitrate, aspectRatio, audioEnabled)
         }
 
@@ -128,6 +112,7 @@ class RecordingService : Service() {
         audioEnabled: Boolean
     ) {
         val tempFile = File(cacheDir, "rawcapture_temp_${System.currentTimeMillis()}.mp4")
+        Log.i(TAG, "Output temp file: ${tempFile.absolutePath}")
 
         val targetWidth: Int
         val targetHeight: Int
@@ -144,12 +129,9 @@ class RecordingService : Service() {
             "Low" -> 2_000_000
             "Medium" -> 6_000_000
             "High" -> 12_000_000
-            else -> {
-                bitrate.toIntOrNull() ?: 6_000_000
-            }
+            else -> bitrate.toIntOrNull() ?: 6_000_000
         }
 
-        // Apply aspect ratio
         val finalWidth: Int
         val finalHeight: Int
         when (aspectRatio) {
@@ -159,39 +141,55 @@ class RecordingService : Service() {
             else -> { finalWidth = targetWidth; finalHeight = targetHeight }
         }
 
-        engine = VideoProcessingEngine(this, serviceScope)
+        Log.i(TAG, "Final resolution: ${finalWidth}x${finalHeight}")
+
+        // Create engine (no scope needed)
+        val engine = VideoProcessingEngine(this)
 
         // Observe state for notifications
-        serviceScope.launch {
-            engine!!.state.collectLatest { state ->
+        val observeJob = serviceScope.launch {
+            engine.state.collectLatest { state ->
                 currentState = state
                 updateNotification(state)
             }
         }
 
-        val result = engine!!.process(
-            sourceUri = uri,
-            outputPath = tempFile.absolutePath,
-            targetWidth = finalWidth,
-            targetHeight = finalHeight,
-            targetFps = fps,
-            targetBitrate = bitrateValue,
-            audioEnabled = audioEnabled
-        )
+        val result = try {
+            engine.process(
+                sourceUri = uri,
+                outputPath = tempFile.absolutePath,
+                targetWidth = finalWidth,
+                targetHeight = finalHeight,
+                targetFps = fps,
+                targetBitrate = bitrateValue,
+                audioEnabled = audioEnabled
+            )
+        } catch (e: Exception) {
+            Log.e(TAG, "Processing threw exception", e)
+            VideoProcessingEngine.Result.Error(e.message ?: "Unknown error")
+        } finally {
+            observeJob.cancel()
+        }
 
         when (result) {
             is VideoProcessingEngine.Result.Success -> {
-                // Save to gallery
+                Log.i(TAG, "Processing success: ${result.outputPath}")
                 val timestamp = SimpleDateFormat("yyyy_MM_dd_HHmmss", Locale.getDefault()).format(Date())
                 val displayName = "RawCapture_${timestamp}.mp4"
-                val saved = MediaStoreManager.saveVideoToGallery(
-                    context = this,
-                    sourceFile = tempFile,
-                    displayName = displayName
-                )
-                if (saved != null) {
-                    Log.i(TAG, "Saved to gallery: $saved")
-                    showCompletionNotification(displayName)
+                try {
+                    val saved = MediaStoreManager.saveVideoToGallery(
+                        context = this,
+                        sourceFile = tempFile,
+                        displayName = displayName
+                    )
+                    if (saved != null) {
+                        Log.i(TAG, "Saved to gallery: $saved")
+                        showCompletionNotification(displayName)
+                    } else {
+                        Log.e(TAG, "Failed to save to gallery")
+                    }
+                } catch (e: Exception) {
+                    Log.e(TAG, "Gallery save failed", e)
                 }
                 tempFile.delete()
             }
@@ -217,12 +215,6 @@ class RecordingService : Service() {
             PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
         )
 
-        val cancelIntent = PendingIntent.getBroadcast(
-            this, 1,
-            Intent(this, RecordingService::class.java).apply { action = ACTION_CANCEL },
-            PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
-        )
-
         return NotificationCompat.Builder(this, App.CHANNEL_RECORDING)
             .setContentTitle("RawCapture")
             .setContentText(text)
@@ -230,7 +222,6 @@ class RecordingService : Service() {
             .setContentIntent(pendingIntent)
             .setOngoing(true)
             .setProgress(100, progress, progress == 0)
-            .addAction(R.drawable.ic_recording, "Cancel", cancelIntent)
             .build()
     }
 
@@ -239,35 +230,47 @@ class RecordingService : Service() {
         val text = "${state.status} - $progress%"
         val notification = createNotification(text, progress)
 
-        val manager = getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
-        manager.notify(NOTIFICATION_ID, notification)
+        try {
+            val manager = getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
+            manager.notify(NOTIFICATION_ID, notification)
+        } catch (e: Exception) {
+            Log.w(TAG, "Failed to update notification", e)
+        }
     }
 
     private fun showCompletionNotification(fileName: String) {
-        val notification = NotificationCompat.Builder(this, App.CHANNEL_COMPLETE)
-            .setContentTitle("Video Converted!")
-            .setContentText("$fileName saved to Gallery")
-            .setSmallIcon(R.drawable.ic_recording)
-            .setAutoCancel(true)
-            .setContentIntent(PendingIntent.getActivity(
-                this, 0,
-                Intent(this, MainActivity::class.java),
-                PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
-            ))
-            .build()
+        try {
+            val notification = NotificationCompat.Builder(this, App.CHANNEL_COMPLETE)
+                .setContentTitle("Video Converted!")
+                .setContentText("$fileName saved to Gallery")
+                .setSmallIcon(R.drawable.ic_recording)
+                .setAutoCancel(true)
+                .setContentIntent(PendingIntent.getActivity(
+                    this, 0,
+                    Intent(this, MainActivity::class.java),
+                    PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
+                ))
+                .build()
 
-        val manager = getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
-        manager.notify(NOTIFICATION_ID + 1, notification)
+            val manager = getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
+            manager.notify(NOTIFICATION_ID + 1, notification)
+        } catch (e: Exception) {
+            Log.w(TAG, "Failed to show completion notification", e)
+        }
     }
 
     private fun releaseWakeLock() {
-        wakeLock?.let {
-            if (it.isHeld) it.release()
-        }
+        try {
+            wakeLock?.let {
+                if (it.isHeld) it.release()
+            }
+        } catch (_: Exception) {}
         wakeLock = null
     }
 
     override fun onDestroy() {
+        Log.i(TAG, "Service destroyed")
+        processingJob?.cancel()
         serviceScope.cancel()
         releaseWakeLock()
         isServiceRunning = false
