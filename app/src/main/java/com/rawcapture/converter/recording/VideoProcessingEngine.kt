@@ -5,23 +5,24 @@ import android.net.Uri
 import android.os.Handler
 import android.os.Looper
 import android.util.Log
-import com.arthenica.ffmpegkit.FFmpegKit
-import com.arthenica.ffmpegkit.FFmpegSession
-import com.arthenica.ffmpegkit.ReturnCode
+import androidx.media3.common.MediaItem
+import androidx.media3.transformer.Composition
+import androidx.media3.transformer.EditedMediaItem
+import androidx.media3.transformer.ExportException
+import androidx.media3.transformer.ExportResult
+import androidx.media3.transformer.Transformer
 import kotlinx.coroutines.*
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import java.io.File
-import java.io.IOException
 
 /**
- * Video Processing Engine using FFmpegKit
+ * Video Processing Engine using Media3 Transformer API
  * 
- * FFmpegKit is the most reliable video transcoding library for Android.
- * Used by VLC, Google Photos, and many production apps.
- * 
- * Handles ALL codec negotiation, pixel format conversion, and encoding internally.
- * Works on ALL Android devices (API 24+).
+ * Fixed issues:
+ * 1. Copy source to temp file (Transformer needs file path, not content URI)
+ * 2. Proper error handling and logging
+ * 3. Better completion detection
  */
 class VideoProcessingEngine(
     private val context: Context
@@ -49,7 +50,7 @@ class VideoProcessingEngine(
     val state: StateFlow<ProcessingState> = _state
 
     @Volatile private var isCancelled = false
-    private var session: FFmpegSession? = null
+    private var transformer: Transformer? = null
     private var startTimeMs = 0L
     private var sourceDurationMs = 0L
 
@@ -63,7 +64,7 @@ class VideoProcessingEngine(
         Log.i(TAG, "Cancel requested")
         isCancelled = true
         try {
-            session?.cancel()
+            transformer?.cancel()
         } catch (e: Exception) {
             Log.w(TAG, "Cancel error", e)
         }
@@ -84,8 +85,9 @@ class VideoProcessingEngine(
         startTimeMs = System.currentTimeMillis()
 
         Log.i(TAG, "========================================")
-        Log.i(TAG, "STARTING FFMPEG VIDEO TRANSCODING")
-        Log.i(TAG, "Target: ${targetWidth}x${targetHeight} @ ${targetFps}fps")
+        Log.i(TAG, "STARTING MEDIA3 TRANSFORMER")
+        Log.i(TAG, "Source: $sourceUri")
+        Log.i(TAG, "Output: $outputPath")
         Log.i(TAG, "========================================")
 
         updateState(
@@ -111,78 +113,75 @@ class VideoProcessingEngine(
                 Log.w(TAG, "Could not get duration", e)
             }
 
-            // Copy source to temp file (FFmpeg needs file path, not content URI)
-            updateState(status = "Copying source file...")
+            // Copy source to temp file (Transformer needs file path)
+            updateState(status = "Copying source...")
             Log.i(TAG, "Copying source to temp file")
             
             tempInputFile = File(context.cacheDir, "rawcapture_input_${System.currentTimeMillis()}.mp4")
             copySourceToTemp(sourceUri, tempInputFile)
             Log.i(TAG, "Source copied to: ${tempInputFile.absolutePath}")
 
-            // Build FFmpeg command
-            val command = buildCommand(
-                tempInputFile.absolutePath,
-                outputPath,
-                targetWidth,
-                targetHeight,
-                targetFps,
-                targetBitrate,
-                audioEnabled
-            )
-            
-            Log.i(TAG, "FFmpeg command: $command")
-            updateState(status = "Starting transcoding...")
-
-            // Execute FFmpeg
+            // Create listener
             var completed = false
             var success = false
             var errorMessage: String? = null
 
-            session = FFmpegKit.executeAsync(command,
-                { statistics ->
-                    // Update progress from statistics
-                    val duration = statistics.duration
-                    val time = statistics.time
-                    
-                    if (duration > 0 && time > 0) {
-                        val progress = (time.toFloat() / duration).coerceIn(0f, 0.99f)
-                        val elapsed = System.currentTimeMillis() - startTimeMs
-                        val remaining = if (progress > 0.01f) {
-                            ((elapsed / progress) - elapsed).toLong()
-                        } else 0L
-                        
-                        updateState(
-                            progress = progress,
-                            elapsedMs = elapsed,
-                            remainingMs = remaining,
-                            currentFps = statistics.videoFrameRate.toFloat()
-                        )
-                    }
-                },
-                { session ->
-                    val returnCode = session.returnCode
-                    if (ReturnCode.isSuccess(returnCode)) {
-                        success = true
-                        Log.i(TAG, "FFmpeg completed successfully")
-                    } else if (ReturnCode.isCancel(returnCode)) {
-                        Log.i(TAG, "FFmpeg cancelled")
-                        isCancelled = true
-                    } else {
-                        errorMessage = session.failStackTrace
-                        Log.e(TAG, "FFmpeg failed: $errorMessage")
-                    }
+            val listener = object : Transformer.Listener {
+                override fun onCompleted(composition: Composition, exportResult: ExportResult) {
+                    Log.i(TAG, "Transformation completed successfully!")
+                    success = true
                     completed = true
                 }
-            )
 
-            // Wait for completion
-            while (!completed && !isCancelled) {
-                delay(500)
+                override fun onError(
+                    composition: Composition,
+                    exportResult: ExportResult,
+                    exportException: ExportException
+                ) {
+                    Log.e(TAG, "Transformation error", exportException)
+                    errorMessage = exportException.message ?: "Unknown error"
+                    completed = true
+                }
             }
 
-            // Handle result
+            // Create Transformer
+            transformer = Transformer.Builder(context)
+                .addListener(listener)
+                .build()
+
+            // Create edited media item from FILE (not URI)
+            val mediaItem = MediaItem.fromUri(Uri.fromFile(tempInputFile))
+            val editedItem = EditedMediaItem.Builder(mediaItem)
+                .setRemoveAudio(!audioEnabled)
+                .build()
+
+            updateState(status = "Starting transformation...")
+            Log.i(TAG, "Starting transformation...")
+
+            // Start transformation
+            transformer!!.start(editedItem, outputPath)
+
+            // Poll for completion
+            while (!completed && !isCancelled) {
+                delay(500)
+
+                // Update progress from elapsed time
+                val elapsed = System.currentTimeMillis() - startTimeMs
+                if (sourceDurationMs > 0) {
+                    val progress = (elapsed.toFloat() / sourceDurationMs).coerceIn(0f, 0.95f)
+                    val remaining = ((sourceDurationMs / progress) - sourceDurationMs).toLong().coerceAtLeast(0)
+                    
+                    updateState(
+                        progress = progress,
+                        elapsedMs = elapsed,
+                        remainingMs = remaining
+                    )
+                }
+            }
+
+            // Handle cancellation
             if (isCancelled) {
-                Log.i(TAG, "Processing cancelled")
+                Log.i(TAG, "Cancelled")
                 tempInputFile?.delete()
                 File(outputPath).delete()
                 return@withContext Result.Cancelled
@@ -192,13 +191,14 @@ class VideoProcessingEngine(
             tempInputFile?.delete()
             tempInputFile = null
 
+            // Handle result
             if (success) {
                 val elapsed = System.currentTimeMillis() - startTimeMs
                 val outputFile = File(outputPath)
                 val fileSize = if (outputFile.exists()) outputFile.length() else 0L
 
                 Log.i(TAG, "========================================")
-                Log.i(TAG, "TRANSCODING COMPLETE")
+                Log.i(TAG, "TRANSFORMATION COMPLETE")
                 Log.i(TAG, "Time: ${elapsed}ms")
                 Log.i(TAG, "Size: $fileSize bytes")
                 Log.i(TAG, "========================================")
@@ -215,7 +215,7 @@ class VideoProcessingEngine(
 
                 return@withContext Result.Success(outputPath, sourceDurationMs, fileSize)
             } else {
-                val errorMsg = errorMessage ?: "FFmpeg failed"
+                val errorMsg = errorMessage ?: "Transformation failed"
                 Log.e(TAG, "Processing failed: $errorMsg")
                 updateState(
                     error = errorMsg,
@@ -237,7 +237,7 @@ class VideoProcessingEngine(
             )
             return@withContext Result.Error(e.message ?: "Unknown error")
         } finally {
-            session = null
+            transformer = null
             Log.i(TAG, "Cleanup done")
         }
     }
@@ -248,37 +248,11 @@ class VideoProcessingEngine(
                 tempFile.outputStream().use { output ->
                     input.copyTo(output)
                 }
-            } ?: throw IOException("Cannot open source file")
+            } ?: throw java.io.IOException("Cannot open source file")
         } catch (e: Exception) {
             Log.e(TAG, "Failed to copy source", e)
-            throw IOException("Failed to copy source file: ${e.message}")
+            throw java.io.IOException("Failed to copy source file: ${e.message}")
         }
-    }
-
-    private fun buildCommand(
-        inputPath: String,
-        outputPath: String,
-        width: Int,
-        height: Int,
-        fps: Int,
-        bitrate: Int,
-        audioEnabled: Boolean
-    ): String {
-        val videoCodec = "libx264"
-        val audioCodec = if (audioEnabled) "aac" else "an"
-        val videoBitrate = "${bitrate / 1000}k"
-        val audioBitrate = "128k"
-        
-        return "-i \"$inputPath\" " +
-               "-c:v $videoCodec " +
-               "-preset medium " +
-               "-s ${width}x$height " +
-               "-r $fps " +
-               "-b:v $videoBitrate " +
-               "-c:a $audioCodec " +
-               "-b:a $audioBitrate " +
-               "-movflags +faststart " +
-               "-y \"$outputPath\""
     }
 
     private fun updateState(
