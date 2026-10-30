@@ -3,6 +3,7 @@ package com.rawcapture.converter.recording
 import android.content.Context
 import android.media.MediaCodec
 import android.media.MediaCodecInfo
+import android.media.MediaCodecList
 import android.media.MediaExtractor
 import android.media.MediaFormat
 import android.media.MediaMuxer
@@ -101,7 +102,7 @@ class VideoProcessingEngine(
                 ?: return@withContext Result.Error("Cannot open source video")
 
             videoExtractor = MediaExtractor()
-            videoExtractor.setFileDescriptor(videoFd.fileDescriptor)
+            videoExtractor.setDataSource(videoFd.fileDescriptor, 0, videoFd.statSize)
 
             // ---- Find tracks ----
             var videoTrackIndex = -1
@@ -138,12 +139,8 @@ class VideoProcessingEngine(
             val srcFps = if (videoFormat.containsKey(MediaFormat.KEY_FRAME_RATE))
                 videoFormat.getInteger(MediaFormat.KEY_FRAME_RATE) else 30
 
-            // Estimate total frames
-            totalFrames = if (videoFormat.containsKey(MediaFormat.KEY_FRAME_COUNT)) {
-                videoFormat.getInteger(MediaFormat.KEY_FRAME_COUNT).toLong()
-            } else {
-                ((sourceDuration / 1_000_000.0) * srcFps).toLong().coerceAtLeast(1)
-            }
+            // Estimate total frames from duration and fps
+            totalFrames = ((sourceDuration / 1_000_000.0) * srcFps).toLong().coerceAtLeast(1)
 
             Log.i(TAG, "Source: ${srcW}x${srcH} @ ${srcFps}fps, dur=${sourceDuration}us, tracks=v:$videoTrackIndex a:$audioTrackIndex")
             Log.i(TAG, "Target: ${targetWidth}x${targetHeight} @ ${targetFps}fps, bitrate=${targetBitrate}")
@@ -153,7 +150,7 @@ class VideoProcessingEngine(
                 val audioFd = context.contentResolver.openFileDescriptor(sourceUri, "r")
                 if (audioFd != null) {
                     audioExtractor = MediaExtractor()
-                    audioExtractor.setFileDescriptor(audioFd.fileDescriptor)
+                    audioExtractor.setDataSource(audioFd.fileDescriptor, 0, audioFd.statSize)
                     audioExtractor.selectTrack(audioTrackIndex)
                 }
             }
