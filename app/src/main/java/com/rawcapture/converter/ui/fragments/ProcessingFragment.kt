@@ -8,11 +8,9 @@ import android.view.LayoutInflater
 import android.view.View
 import android.view.ViewGroup
 import android.view.animation.LinearInterpolator
-import android.widget.Toast
 import androidx.fragment.app.Fragment
 import androidx.lifecycle.lifecycleScope
 import com.rawcapture.converter.MainActivity
-import com.rawcapture.converter.R
 import com.rawcapture.converter.recording.RecordingService
 import com.rawcapture.converter.recording.VideoProcessingEngine
 import com.rawcapture.converter.databinding.FragmentProcessingBinding
@@ -29,6 +27,7 @@ class ProcessingFragment : Fragment() {
     private var pulseAnimator: ObjectAnimator? = null
     private var observeJob: Job? = null
     private var completedNavigated = false
+    private var errorShown = false
 
     override fun onCreateView(inflater: LayoutInflater, container: ViewGroup?, savedInstanceState: Bundle?): View {
         _binding = FragmentProcessingBinding.inflate(inflater, container, false)
@@ -38,6 +37,7 @@ class ProcessingFragment : Fragment() {
     override fun onViewCreated(view: View, savedInstanceState: Bundle?) {
         super.onViewCreated(view, savedInstanceState)
         completedNavigated = false
+        errorShown = false
 
         // Recording dot pulse animation
         pulseAnimator = ObjectAnimator.ofFloat(binding.recordingDot, "alpha", 1f, 0.3f).apply {
@@ -54,26 +54,36 @@ class ProcessingFragment : Fragment() {
             (activity as? MainActivity)?.startRecording()
         }
 
-        // Poll RecordingService shared state for UI updates
+        // Poll RecordingService state for UI updates
         observeJob = viewLifecycleOwner.lifecycleScope.launch {
+            var consecutiveCompleteChecks = 0
+            
             while (isActive) {
                 val state = RecordingService.currentState
                 updateUI(state)
 
-                // Check if complete - navigate only once
-                if (state.isComplete && state.outputFilePath != null && !completedNavigated) {
-                    completedNavigated = true
-                    navigateToCompleted(state)
-                    break
+                // Check if complete - need 3 consecutive checks to avoid race condition
+                if (state.isComplete && state.outputFilePath != null) {
+                    consecutiveCompleteChecks++
+                    if (consecutiveCompleteChecks >= 3 && !completedNavigated) {
+                        completedNavigated = true
+                        Log.i(TAG, "Processing complete, navigating")
+                        navigateToCompleted(state)
+                        break
+                    }
+                } else {
+                    consecutiveCompleteChecks = 0
                 }
 
-                // Check for error
-                if (state.error != null) {
+                // Check for error - show once
+                if (state.error != null && !errorShown) {
+                    errorShown = true
                     binding.tvStatus.text = "Error: ${state.error}"
-                    // Don't navigate away - let user see the error and cancel
+                    Log.e(TAG, "Processing error: ${state.error}")
+                    // Don't navigate, let user see error and cancel
                 }
 
-                delay(300)
+                delay(100) // Poll every 100ms for smoother updates
             }
         }
 

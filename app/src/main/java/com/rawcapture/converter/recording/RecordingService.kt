@@ -29,10 +29,17 @@ class RecordingService : Service() {
         const val NOTIFICATION_ID = 1001
         const val ACTION_CANCEL = "com.rawcapture.converter.CANCEL"
 
-        // Shared state for UI
+        // Shared state
+        @Volatile
         var currentState: VideoProcessingEngine.ProcessingState = VideoProcessingEngine.ProcessingState()
             private set
+        
+        @Volatile
         var isServiceRunning = false
+            private set
+        
+        @Volatile
+        var processingComplete = false
             private set
     }
 
@@ -45,6 +52,7 @@ class RecordingService : Service() {
     override fun onCreate() {
         super.onCreate()
         isServiceRunning = true
+        processingComplete = false
         Log.i(TAG, "Service created")
     }
 
@@ -58,8 +66,8 @@ class RecordingService : Service() {
             return START_NOT_STICKY
         }
 
-        // Start foreground notification IMMEDIATELY
-        val startNotification = createNotification("Starting video conversion...", 0)
+        // Start foreground notification
+        val startNotification = createNotification("Starting...", 0)
         try {
             startForeground(NOTIFICATION_ID, startNotification)
         } catch (e: Exception) {
@@ -91,11 +99,9 @@ class RecordingService : Service() {
         val aspectRatio = intent.getStringExtra("aspect_ratio") ?: "Original"
         val audioEnabled = intent.getBooleanExtra("audio_enabled", true)
 
-        Log.i(TAG, "Starting processing: uri=$uriString, res=$resolution, fps=$fps, bitrate=$bitrate, audio=$audioEnabled")
+        Log.i(TAG, "Starting: res=$resolution, fps=$fps, bitrate=$bitrate")
 
-        // Cancel any existing processing
         processingJob?.cancel()
-
         processingJob = serviceScope.launch {
             processVideo(videoUri, resolution, fps, bitrate, aspectRatio, audioEnabled)
         }
@@ -112,10 +118,10 @@ class RecordingService : Service() {
         audioEnabled: Boolean
     ) {
         val tempFile = File(cacheDir, "rawcapture_temp_${System.currentTimeMillis()}.mp4")
-        Log.i(TAG, "Output temp file: ${tempFile.absolutePath}")
+        Log.i(TAG, "Output: ${tempFile.absolutePath}")
 
-        val targetWidth: Int
-        val targetHeight: Int
+        var targetWidth: Int
+        var targetHeight: Int
         when (resolution) {
             "480p" -> { targetWidth = 854; targetHeight = 480 }
             "720p" -> { targetWidth = 1280; targetHeight = 720 }
@@ -125,6 +131,18 @@ class RecordingService : Service() {
             else -> { targetWidth = 1920; targetHeight = 1080 }
         }
 
+        // Handle aspect ratio
+        when (aspectRatio) {
+            "9:16" -> {
+                val temp = targetWidth
+                targetWidth = targetHeight
+                targetHeight = temp
+            }
+            "1:1" -> {
+                targetWidth = targetHeight
+            }
+        }
+
         val bitrateValue: Int = when (bitrate) {
             "Low" -> 2_000_000
             "Medium" -> 6_000_000
@@ -132,18 +150,8 @@ class RecordingService : Service() {
             else -> bitrate.toIntOrNull() ?: 6_000_000
         }
 
-        val finalWidth: Int
-        val finalHeight: Int
-        when (aspectRatio) {
-            "16:9" -> { finalWidth = targetWidth; finalHeight = targetHeight }
-            "9:16" -> { finalWidth = targetHeight; finalHeight = targetWidth }
-            "1:1" -> { finalWidth = targetHeight; finalHeight = targetHeight }
-            else -> { finalWidth = targetWidth; finalHeight = targetHeight }
-        }
+        Log.i(TAG, "Final: ${targetWidth}x${targetHeight} @ ${fps}fps, bitrate=$bitrateValue")
 
-        Log.i(TAG, "Final resolution: ${finalWidth}x${finalHeight}")
-
-        // Create engine (no scope needed)
         val engine = VideoProcessingEngine(this)
 
         // Observe state for notifications
@@ -151,6 +159,12 @@ class RecordingService : Service() {
             engine.state.collectLatest { state ->
                 currentState = state
                 updateNotification(state)
+                
+                // Log completion
+                if (state.isComplete) {
+                    Log.i(TAG, "Processing complete!")
+                    processingComplete = true
+                }
             }
         }
 
@@ -158,14 +172,14 @@ class RecordingService : Service() {
             engine.process(
                 sourceUri = uri,
                 outputPath = tempFile.absolutePath,
-                targetWidth = finalWidth,
-                targetHeight = finalHeight,
+                targetWidth = targetWidth,
+                targetHeight = targetHeight,
                 targetFps = fps,
                 targetBitrate = bitrateValue,
                 audioEnabled = audioEnabled
             )
         } catch (e: Exception) {
-            Log.e(TAG, "Processing threw exception", e)
+            Log.e(TAG, "Processing exception", e)
             VideoProcessingEngine.Result.Error(e.message ?: "Unknown error")
         } finally {
             observeJob.cancel()
@@ -173,7 +187,7 @@ class RecordingService : Service() {
 
         when (result) {
             is VideoProcessingEngine.Result.Success -> {
-                Log.i(TAG, "Processing success: ${result.outputPath}")
+                Log.i(TAG, "Success: ${result.outputPath}")
                 val timestamp = SimpleDateFormat("yyyy_MM_dd_HHmmss", Locale.getDefault()).format(Date())
                 val displayName = "RawCapture_${timestamp}.mp4"
                 try {
@@ -183,10 +197,10 @@ class RecordingService : Service() {
                         displayName = displayName
                     )
                     if (saved != null) {
-                        Log.i(TAG, "Saved to gallery: $saved")
+                        Log.i(TAG, "Saved: $saved")
                         showCompletionNotification(displayName)
                     } else {
-                        Log.e(TAG, "Failed to save to gallery")
+                        Log.e(TAG, "Save failed")
                     }
                 } catch (e: Exception) {
                     Log.e(TAG, "Gallery save failed", e)
@@ -194,11 +208,11 @@ class RecordingService : Service() {
                 tempFile.delete()
             }
             is VideoProcessingEngine.Result.Error -> {
-                Log.e(TAG, "Processing error: ${result.message}")
+                Log.e(TAG, "Error: ${result.message}")
                 tempFile.delete()
             }
             is VideoProcessingEngine.Result.Cancelled -> {
-                Log.i(TAG, "Processing cancelled")
+                Log.i(TAG, "Cancelled")
                 tempFile.delete()
             }
         }
@@ -234,7 +248,7 @@ class RecordingService : Service() {
             val manager = getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
             manager.notify(NOTIFICATION_ID, notification)
         } catch (e: Exception) {
-            Log.w(TAG, "Failed to update notification", e)
+            Log.w(TAG, "Notification update failed", e)
         }
     }
 
@@ -255,15 +269,13 @@ class RecordingService : Service() {
             val manager = getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
             manager.notify(NOTIFICATION_ID + 1, notification)
         } catch (e: Exception) {
-            Log.w(TAG, "Failed to show completion notification", e)
+            Log.w(TAG, "Completion notification failed", e)
         }
     }
 
     private fun releaseWakeLock() {
         try {
-            wakeLock?.let {
-                if (it.isHeld) it.release()
-            }
+            wakeLock?.let { if (it.isHeld) it.release() }
         } catch (_: Exception) {}
         wakeLock = null
     }
